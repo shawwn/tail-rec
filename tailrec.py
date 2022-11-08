@@ -1,3 +1,4 @@
+from __future__ import annotations
 import dis, types
 
 def unpack_op(bytecode): 
@@ -21,7 +22,7 @@ def unpack_op(bytecode):
             oparg = None
         yield (i, opcode, oparg)
 
-def find_linestarts(codeobj):
+def find_linestarts(codeobj, firstlineno=None):
     """Finds the offsets in a bytecode which are the start a line in the source code.
     Parameters
     =========================================
@@ -31,10 +32,12 @@ def find_linestarts(codeobj):
     =========================================
     dict: a dictionary with offsets as the keys and their line numbers as their values of offsets
     """
+    if firstlineno is None:
+      firstlineno = codeobj.co_firstlineno
     byte_increments = codeobj.co_lnotab[0::2]
     line_increments = codeobj.co_lnotab[1::2]
     byte = 0
-    line = codeobj.co_firstlineno
+    line = firstlineno
     linestart_dict = {byte: line}      
     for byte_incr, line_incr in zip(byte_increments,
                                     line_increments):
@@ -158,8 +161,10 @@ def disassemble_to_list(c):
     '''     
     code_list = []
     bytecode = c.co_code
+    offsets = []
     for offset, opcode, oparg in unpack_op(bytecode):
         argval = get_argvalue(offset, c, opcode, oparg)
+        offsets.append(offset)
         if argval is not None:
             if type(argval)==str:
                 argval = argval.strip("\'")
@@ -170,7 +175,7 @@ def disassemble_to_list(c):
                 code_list.append([dis.opname[opcode], oparg])
             else:
                 code_list.append([dis.opname[opcode]])              
-    return code_list
+    return code_list, offsets
 
 
 def get_oparg(offset, opcode, argval, constants, varnames, names, cell_names):
@@ -253,7 +258,7 @@ def tail_recursion(f):
     function: the input function with a new code object and modified bytecode which is tail-call optimized
     '''
     c = f.__code__
-    disassembled_bytecode = disassemble_to_list(c)
+    disassembled_bytecode, offsets = disassemble_to_list(c)
     i = 0
     func_name = c.co_name
     while i < len(disassembled_bytecode):
@@ -327,3 +332,192 @@ def tail_recursion(f):
     f.__code__ = nc
     
     return f
+
+
+
+def assemble_from(code_list, c):
+  return assemble(disassembled_bytecode,
+      c.co_consts,
+      c.co_varnames, c.co_names,
+      c.co_cellvars+c.co_freevars)
+
+
+from argparse import Namespace as NS
+import re
+
+
+order = """
+co_argcount co_posonlyargcount co_kwonlyargcount
+co_nlocals co_stacksize co_flags
+co_varnames co_filename co_name 
+co_firstlineno co_lnotab 
+co_cellvars co_freevars
+co_consts co_names 
+co_code
+""".split()
+
+def info_order(c):
+  ks = [*order]
+  for k in dir(c):
+    if k not in ks:
+      ks.append(k)
+  return ks
+
+class Info(NS):
+  def __repr__(self):
+    s = super().__repr__()
+    #return s.replace(', ', ',\n  ')
+    return re.sub(r'([a-zA-Z_][a-zA-Z0-9_]+)=(.*?)[,][ ]', lambda m: f'\n  {m.group(1)}={m.group(2)},', s)
+
+
+import dataclasses
+from typing import *
+
+T = TypeVar("T")
+
+import types
+import json
+
+class LineInfo(Info):
+  byte: Tuple[int]
+  line: Tuple[int]
+  @classmethod
+  def new(cls: Type[T], c: types.CodeType, firstline=None) -> T:
+    starts = find_linestarts(c, firstline)
+    return cls(byte=tuple(starts.keys()), line=tuple(starts.values()))
+
+
+def lineinfo(c: types.CodeType, firstline: int = None):
+  return LineInfo.new(c, firstline)
+
+def dumps(x):
+  try:
+    return json.dumps(x)
+  except TypeError:
+    return repr(x)
+
+import contextvars as CV
+from contextlib import contextmanager
+
+@contextmanager
+def CV_let(var: CV.ContextVar, val):
+  prev = var.set(val)
+  try:
+    yield
+  finally:
+    var.reset(prev)
+
+if 'indentation' not in globals():
+  indentation: CV.ContextVar[int] = CV.ContextVar("indentation", default=0)
+
+def ind():
+  return ' ' * indentation.get()
+
+@contextmanager
+def indent(n=2):
+  with CV_let(indentation, indentation.get() + n):
+    yield
+  
+
+@dataclasses.dataclass
+class CodeOp:
+  offset: Optional[int]
+  line: Optional[int]
+  op: List
+  def __repr__(self):
+    #return repr(tuple([self.offset, self.line, self.op]))
+    #return f'{self.offset} at line {self.line} {self.op[0]}(' + (f'{self.op[1]!r}' if len(self.op) > 1 else '') + ')'
+    offset = "" if self.offset is None else self.offset
+    line = "" if self.line is None else self.line
+    lh = "\n" + ind() + "|"
+    with indent(4):
+      return lh + f'{line:<4}' + f'{offset:4}| ' + f'({self.op[0]}' + (f' {dumps(self.op[1])}' if len(self.op) > 1 else '') + ')'
+
+
+class CodeOpInfo(CodeOp):
+  def __init__(self, c: types.CodeType, op: CodeOp):
+    self.c = c
+    self.op = op
+  def __repr__(self):
+    s = repr(self.op)
+
+
+class CodeOps:
+  @classmethod
+  def new(cls, c: types.CodeType, firstline: int = None) -> List[CodeOp]:
+    lnotab = lineinfo(c, firstline)
+    code, offsets = disassemble_to_list(c)
+    labels = findlabels(c)
+    ops = []
+    line = None
+    for offset, op in zip(offsets, code):
+      if offset in lnotab.byte:
+        line = lnotab.line[lnotab.byte.index(offset)]
+      else:
+        line = None
+      if offset not in labels:
+        offset = None
+      if len(op) > 1 and isinstance(op[1], types.CodeType):
+        op[1] = [op[1], cls.new(op[1])]
+      ops.append(CodeOp(offset, line, op))
+    return ops
+
+import inspect
+
+class CodeInfo(Info):
+  this: types.CodeType
+  argcount: int
+  posonlyargcount: int
+  kwonlyargcount: int
+  nlocals: int
+  stacksize: int
+  flags: int
+  varnames: Tuple[str]
+  filename: str
+  name: str
+  firstlineno: int
+  lnotab: LineInfo
+  cellvars: Tuple[str]
+  freevars: Tuple[str]
+  consts: Tuple[Any]
+  names: Tuple[str]
+  #code: List[List]
+  #offsets: List[int]
+  code: List[CodeOps]
+
+  @classmethod
+  def new(cls: Type[T], c: types.CodeType, firstline=None) -> T:
+    #c = inspect.unwrap(c)
+    #c = getattr(c, '__code__') if hasattr(c, '__code__') else c
+    c = unwrap(c)
+    self = cls(this=c, **{k[len('co_'):]: getattr(c, k) for k in info_order(c) if k.startswith('co_')})
+    self.lnotab = lineinfo(c, firstline)
+    #self.code, self.offsets = disassemble_to_list(c)
+    self.code = CodeOps.new(c, firstline)
+    return self
+
+
+from functools import singledispatch as dispatch
+
+@dispatch
+def unwrap(x):
+  if hasattr(x, '__code__'):
+    return unwrap(x.__code__)
+  v = inspect.unwrap(x)
+  if v is not x:
+    return unwrap(v)
+  return x
+
+@unwrap.register(types.CodeType)
+def unwrap_CodeType(x):
+  return x
+
+import functools
+
+@unwrap.register(functools.partial)
+def unwrap_partial(x):
+  return unwrap(x.func)
+
+
+def info(c, firstline=None):
+  return CodeInfo.new(c, firstline)
